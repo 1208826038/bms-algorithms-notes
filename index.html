@@ -1,0 +1,828 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>BMS 核心算法与 Simulink 建模深度解析</title>
+<style>
+  :root{--bg:#0f1115;--fg:#e6e6e6;--muted:#9aa4b2;--accent:#4ea1ff;--code:#1b2030;--border:#2a2f3a;--quote:#1a2230;}
+  *{box-sizing:border-box;}
+  body{margin:0;background:var(--bg);color:var(--fg);font-family:-apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;line-height:1.75;}
+  .wrap{max-width:980px;margin:0 auto;padding:36px 20px 90px;}
+  h1{font-size:30px;border-bottom:2px solid var(--border);padding-bottom:14px;margin-bottom:6px;}
+  h2{font-size:23px;margin-top:42px;border-left:4px solid var(--accent);padding-left:12px;color:#eaf2ff;}
+  h3{font-size:18px;margin-top:28px;color:#cfe3ff;}
+  p{margin:12px 0;}
+  code{background:var(--code);padding:2px 6px;border-radius:4px;font-family:"SFMono-Regular",Consolas,monospace;font-size:13px;color:#ffd479;}
+  pre{background:var(--code);border:1px solid var(--border);border-radius:8px;padding:14px;overflow:auto;}
+  pre code{background:none;padding:0;color:#d6e2f0;font-size:13px;line-height:1.55;}
+  table{border-collapse:collapse;width:100%;margin:18px 0;font-size:14px;}
+  th,td{border:1px solid var(--border);padding:8px 10px;text-align:left;vertical-align:top;}
+  th{background:#161b26;color:#cfe3ff;}
+  tr:nth-child(even) td{background:#12161f;}
+  blockquote{background:var(--quote);border-left:4px solid var(--accent);margin:14px 0;padding:10px 16px;color:var(--muted);border-radius:0 8px 8px 0;}
+  ul{margin:10px 0;padding-left:24px;}
+  li{margin:6px 0;}
+  .meta{color:var(--muted);font-size:13px;margin:4px 0 18px;}
+  a{color:var(--accent);}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="meta">独立仓库 bms-algorithms-notes · 离线可读 · 与 GitHub 上 bms-deep.md 同源</div>
+  <div id="out"></div>
+</div>
+<script type="text/markdown" id="doc">
+# BMS 核心算法与 Simulink 建模深度解析
+
+> 本笔记定位：写给**底层嵌入式工程师 / BMS 算法工程师 / 求职者**。目标是让你不仅"听过 SOC/SOH/均衡"，而是能**看懂原理、能配参数、能在 Simulink 里建模、能用 Embedded Coder 生成产品级 C 代码、能在板子上调实测**。内容比面试速记版深数倍，公式、拓扑、代码生成链路都铺开讲。
+
+## 0. 阅读方法与能力分层
+
+把 BMS 算法能力分成五层，自测你现在在哪一层：
+
+- L1 读懂 spec：知道 SOC/SOH/SOP 是什么，能看 AUTOSAR/ISO 文档。
+- L2 能配参数：在工具里把 OCV 表、容量、内阻、均衡阈值填进去，生成代码能跑。
+- L3 能建模：在 Simulink 把算法搭出来，仿真对得上物理直觉。
+- L4 能生成代码：Embedded Coder 出产品级 C，定点化不溢出，和手写框架能接。
+- L5 能调实测：上板子后电流偏置、低温跳变、均衡发热这些坑能定位能改。
+
+本笔记从 L1 一路铺到 L5。你的优势是**有 S32K144 板子和 MATLAB R2024b**，L3–L5 在家就能练，不必等车企业务。
+
+---
+
+## 1. BMS 系统全景与算法地图
+
+### 1.1 从电芯到算法的数据流
+
+一个电池包（Pack）由若干模组（Module）组成，模组由若干电芯（Cell）串联/并联。BMS 永远在和"不一致性"作斗争：
+
+```
+电芯 → 电压/温度采集(AFE) → 电流采集( shunt/Hall )
+     → 估算层：SOC / SOH / SOP / SOE
+     → 控制层：均衡 / 热管理 / 接触器控制
+     → 通信层：CAN / 以太网(DoIP)
+     → 诊断层：DTC / 绝缘 / 故障注入
+     → 持久化：NvM(学习值/故障快照/标定)
+```
+
+### 1.2 为什么这些量"只能估算不能测量"
+
+你能用 ADC 直接测的是**电压 V、电流 I、温度 T**。而 SOC（剩余容量占比）、SOH（健康度）、SOP（可用功率）、SOE（可用能量）都是**电池内部状态**，没有传感器能直接读出，只能靠"测得的 V/I/T + 模型 + 滤波"反推。这就是 BMS 算法的本质：**状态估计（State Estimation）**。
+
+> 关键认知：BMS 算法 ≈ 一个实时运行的状态估计器 + 一组基于估计结果的安全控制器。它不是查表游戏，是带模型的递归估计。
+
+### 1.3 算法在 AUTOSAR 软件栈的位置
+
+```
+应用层 ASW：SWC(Sensor/SensorActuator/Application) 里的 Runnable
+   └─ 算法（SOC/SOH/均衡决策）
+RTE：Runnable 间数据传递、事件触发
+BSW：
+   ├─ NvM/Fee/Fls：学习值掉电保存
+   ├─ Com/CAN/CANTP：与整车/充电机通信
+   ├─ DCM/DEM/FiM：UDS 诊断、故障、功能抑制
+   └─ OS：任务调度（10ms 估算任务 / 100ms 慢速任务）
+```
+
+所以"算法工程师"在量产项目里，交付物通常是：一个 SWC 的模型/代码 + 一组标定参数（OCV 表、容量、内阻、阈值、滤波增益）+ 一份 MIL/SIL/PIL 报告。
+
+### 1.4 量产视角（和你简历"单季度万级出货"挂钩）
+
+单季度出货上万包，意味着算法必须：
+
+- **鲁棒**：-30℃~60℃、新旧电芯混装、传感器漂移都不崩。
+- **可标定**：不同电芯化学体系（LFP/NMC）靠参数切换，不动代码。
+- **可诊断**：每个估算量都有置信度/故障标志，接 DEM。
+- **可 OTA**：算法和标定分离，能远程更新标定甚至算法。
+
+面试讲"万级出货"时，别只说数量，要讲清楚上面四条你是怎么落地的——这才是差异化。
+
+---
+
+## 2. 电池电化学与等效电路模型（算法地基）
+
+没有模型，所有估计算法都是空中楼阁。本节把模型讲透。
+
+### 2.1 电芯化学体系差异（影响建模假设）
+
+| 体系 | OCV-SOC 形状 | 能量密度 | 温度特性 | 对算法的影响 |
+|---|---|---|---|---|
+| LFP（磷酸铁锂） | 平台极平坦（3.2~3.3V 占 80% SOC） | 中 | 好，低温衰减较小 | **OCV 查表分辨率差**，SOC 高度依赖电流积分 |
+| NMC（三元） | 斜率大、信息丰富 | 高 | 低温衰减大 | OCV 法可用，但低温容量骤降需补偿 |
+| LTO / 钛酸 | 平台平坦 | 低 | 极好 | 类似 LFP 难点 |
+
+> 经验：LFP 车型 SOC 估算几乎不可能纯靠 OCV，必须安时积分 + 滤波 + 偶尔满充校准；NMC 可以 OCV 辅助更重。
+
+### 2.2 等效电路模型（ECM）谱系
+
+| 模型 | 结构 | 参数数 | 算力 | 适用场景 |
+|---|---|---|---|---|
+| Rint（内阻） | 1 个 OCV + 1 个 R0 | 最少 | 极低 | 粗略 SOC、SOP 初算 |
+| 1RC（Thevenin） | OCV + R0 + (R1∥C1) | 少 | 低 | **量产主流**，EKF/UKF 标配 |
+| 2RC | OCV + R0 + 两个 RC 支路 | 中 | 中 | 大功率瞬态、脉冲工况 |
+| PNGV | 含电容表征开路电压漂移 | 中 | 中 | 长时间弛豫 |
+| 分数阶 | 分数阶电容 | 多 | 高 | 科研，量产罕见 |
+
+### 2.3 1RC 模型的方程（务必推到能默写）
+
+状态量：`z` = SOC，`v1` = 极化支路电压 Vc1。
+
+连续时间：
+
+```
+z_dot = -I / (3600 * Qn)                         // 安时积分（Qn 额定容量 Ah）
+v1_dot = ( I*R1 - v1 ) / (R1*C1)                // 极化支路电流=总电流-电容电流
+V  = OCV(z) - I*R0 - v1                         // 端电压 = OCV - 欧姆降 - 极化降
+```
+
+离散化（前向欧拉，步长 Ts）：
+
+```
+z(k)   = z(k-1) - I(k-1)*Ts / (3600*Qn)
+v1(k)  = v1(k-1) + Ts*( I(k-1)*R1 - v1(k-1) ) / (R1*C1)
+V(k)   = OCV(z(k)) - I(k-1)*R0 - v1(k)
+```
+
+> 注意：观测方程里的 `OCV(z)` 是非线性的（查表或多项式），这正是卡尔曼滤波要做线性化的地方。
+
+### 2.4 2RC 模型（大功率必用）
+
+加第二个支路 (R2∥C2)，状态增为 `[z, v1, v2]`：
+
+```
+v1_dot = ( I*R1 - v1 ) / (R1*C1)
+v2_dot = ( I*R2 - v2 ) / (R2*C2)
+V = OCV(z) - I*R0 - v1 - v2
+```
+
+双支路分别捕捉**快极化**（双电层，秒级）和**慢极化**（扩散，十秒~分钟级）。放电大电流时 2RC 比 1RC 端电压预测准很多。
+
+### 2.5 OCV-SOC 曲线：滞回与温度
+
+- **滞回（Hysteresis）**：同一 SOC，充电支路 OCV 比放电支路高几~十几 mV。建模要分"最近是充还是放"，或加滞回状态变量。
+- **温度依赖**：低温 OCV 整体下移、斜率变陡。工程做法：**多温度 OCV 表**，按当前温度插值。
+- **标定方法**：
+  - 静置法：把电池以小电流充/放到目标 SOC，静置数小时让极化消失，记录稳态 V = OCV。
+  - GITT（恒流间歇滴定）：小电流脉冲+长静置，近似准静态 OCV。
+
+### 2.6 参数辨识：HPPC 与 RLS
+
+- **HPPC 脉冲法**（离线）：满电后放电脉冲→测 ΔV/ΔI 得 R0；看恢复曲线斜率得 R1/C1；不同 SOC 重复得全表。
+- **在线辨识**（量产）：用**带遗忘因子的最小二乘（RLS/FFRLS）**实时估 R0/R1/C1，对抗老化导致的参数漂移。
+
+```
+// FFRLS 核心递推（伪代码，定点注意归一化）
+K = P*phi / (lambda + phi'*P*phi);   // 增益
+theta = theta + K*(y - phi'*theta);  // 参数更新
+P = (P - K*phi'*P) / lambda;          // 协方差，lambda<1 加权近期
+```
+
+---
+
+## 3. SOC 估算（本笔记重点）
+
+### 3.1 安时积分（Coulomb Counting）—— 永远的主心骨
+
+```
+z(k) = z(k-1) - eta * I(k-1) * Ts / (3600 * Qn)
+```
+
+- `eta`：库仑效率（充放电效率，通常 0.98~1.0，低温/大倍率 <1）。
+- `Qn`：当前可用容量（随温度、SOH 变化，别用死值）。
+- 误差源：**电流采样偏置**（最致命，会单调漂移）、Qn 不准、温度/老化未补偿。
+
+电流采样实现与坑：
+
+- **分流电阻 + 运放**（shunt）：精度高、成本低，但有功耗和温升；偏置校准靠上电零漂补偿。
+- **霍尔传感器**（Hall）：隔离好、无插入损耗，但温漂大、低温噪声高。
+- 偏置处理：定期（静置时）估一个 `I_offset` 并扣除；或用高通滤波滤掉直流偏置（但会丢慢变分量，需权衡）。
+
+### 3.2 OCV 查表法
+
+静置足够久后 `V ≈ OCV(z)`，反查 OCV-SOC 表得 z。局限：要静置（行车中不可用）、LFP 平坦段分辨率差（几 mV 对应十几 %SOC）。通常作为**校准锚点**而非主算法。
+
+### 3.3 卡尔曼滤波族（核心中的核心）
+
+#### 3.3.1 EKF（扩展卡尔曼滤波）
+
+状态 `x = [z, v1]`（1RC）。把 2.3 的离散式写成：
+
+```
+x(k) = f(x(k-1), u(k-1)) + w(k)      // 状态方程，w~N(0,Q)
+y(k) = h(x(k)) + v(k) = OCV(z(k)) - I*R0 - v1 + v(k)   // 观测=端电压，v~N(0,R)
+```
+
+**雅可比矩阵推导**（这是 EKF 成败关键）：
+
+状态转移雅可比 `F = ∂f/∂x`（前向欧拉）：
+
+```
+F = [ 1,                                        0;
+     0,  1 - Ts/(R1*C1) ]
+```
+
+观测雅可比 `H = ∂h/∂x`：
+
+```
+H = [ dOCV/dz | -1 ]
+```
+
+其中 `dOCV/dz` 用 OCV 表差分（(OCV(z+δ)-OCV(z-δ))/(2δ)）或解析多项式求导得到。这一步若算错，EKF 必发散。
+
+**五步递推**：
+
+```
+// 1) 预测
+x_pred = f(x_est_prev, u);
+P_pred = F * P_est_prev * F' + Q;
+// 2) 增益
+S = H * P_pred * H' + R;
+K = P_pred * H' * inv(S);
+// 3) 更新（y 是实测端电压与预测端电压之差）
+y = V_meas - h(x_pred);
+x_est = x_pred + K * y;
+// 4) 协方差更新
+P_est = (I - K*H) * P_pred;
+// 5) 回写 u/x 供下一步
+```
+
+**噪声整定**：
+
+- `Q`：模型不确定 + 电流噪声。太大→滤波跟踪快但抖；太小→迟钝。
+- `R`：电压传感噪声。电压噪声小则 R 小，滤波更信电压。
+- 经验起步：Q 对角取 SOC 1e-6~1e-8、v1 1e-4；R 取 (mV 级)^2。再用实车数据回灌调。
+
+**数值算例（走两步感受校正）**：
+假设 OCV(z)=3.2+0.6*z（简化线性），R0=0.01, R1=0.005, C1=2000（→τ=10s），Ts=1s，电流 I=10A 放电，Qn=50Ah。
+- 初值 z0=0.8，v1_0=0。
+- 步1：z_pred=0.8-10/(3600*50)=0.8-5.56e-5≈0.79994；v1_pred=0+1*(10*0.005-0)/10=0.005；V_pred=3.2+0.6*0.79994-10*0.01-0.005=3.2+0.47996-0.1-0.005=3.57496。若实测 V_meas=3.57，则 y=-0.00496（电压偏低→说明实际 SOC 略低），K 把 z 往下修正一点。这就是"用电压纠电流积分漂移"的过程。
+
+#### 3.3.2 UKF（无迹卡尔曼）
+
+OCV 高度非线性时，EKF 线性化误差大。**UKF 用 UT 变换（无迹变换）选一组 sigma 点**绕过雅可比：
+
+- 选 2n+1 个 sigma 点，按 `α/β/κ` 控制散布（α 小→点靠近均值）。
+- 传播每个点到下一步 → 加权求均值/协方差 → 预测观测 → 更新。
+- 优点：**不用算雅可比**，对强非线性（尖锐 OCV）更准；代价：算力约 2~3 倍 EKF。
+
+#### 3.3.3 PF（粒子滤波）
+
+- 用大量粒子表示 SOC 后验分布，适合**强非线性/非高斯**。
+- 痛点：权值退化需重采样，算力高；量产 MCU 上通常只在高端平台或离线标定用。
+
+#### 3.3.4 其他路线
+
+- **RLS 在线参数 + SOC 联合估计**：把 OCV 参数也放进状态。
+- **神经网络**：离线用大量数据训 OCV/动力学，线上轻量推理（需 NPU 或足够算力）。
+- **滑模观测器**：对建模误差鲁棒，但抖振需处理。
+
+### 3.4 温度 / 倍率 / 老化补偿
+
+- `Qn(T, SOH)`：低温容量打折（如 0℃ 只有额定 85%），用温度-容量表；SOH 下降容量也降。
+- `eta` 倍率效率：大倍率充放电效率 <1，用效率表。
+- **多温度 OCV 表**：按温度插值，避免低温 SOC 跳变。
+
+### 3.5 初始 SOC 校准策略对比
+
+| 策略 | 触发 | 精度 | 频率 |
+|---|---|---|---|
+| 满充置 100% | 充电到截至电流且电压到顶 | 高 | 每次充满 |
+| 深放置 0% | 放电到截止电压 | 高 | 每次放空 |
+| 静置 OCV 校正 | 停车静置 >30min | 中（LFP 差） |  opportunistic |
+| EKF 在线收敛 | 行车中持续 | 依赖模型 | 持续 |
+
+> 量产现实：用户很少放空/充满，所以**行车中 EKF 持续收敛 + 偶尔满充锚定**是主组合。LFP 用户长期不满充，SOC 会缓慢漂移，需在算法里设"漂移上限+保守处理"。
+
+---
+
+## 4. SOH 估算（健康状态）
+
+### 4.1 定义与两种口径
+
+- **容量法**：`SOH_cap = Qmax_now / Qmax_nominal`（最直观，保修常用）。
+- **内阻法**：`SOH_r = R_nominal / R_now`（内阻增→SOH 降）。
+
+二者不一致很正常：容量衰减慢、内阻增长快。通常报 SOH 取容量法为主。
+
+### 4.2 容量法实现
+
+- **满充容量跟踪**：一次完整充电，从 SOC 校准点充到满，累计安时 = 这段可用容量，外推到全量程得 Qmax_now。
+- **放电容量测试**：周期性（如保养）做完整放电测容量。
+- 难点：用户很少做完整充放，需用"部分充放 + OCV 锚点"拼出容量。
+
+### 4.3 内阻法
+
+- HPPC 测欧姆内阻 R0 和极化内阻，跟踪其增长。老化后期内阻飙升、温升加剧、可用功率下降。
+
+### 4.4 老化机理（理解才能建模）
+
+- **SEI 膜生长**：负极表面固体电解质界面持续增厚，消耗活性锂 → 容量不可逆损失。
+- **锂 plating**：低温大电流充电，锂析出而非嵌入 → 容量损失 + 安全风险。
+- **活性物损失 / 结构破坏**：正极材料相变、颗粒开裂。
+
+### 4.5 增量容量分析 ICA（dQ/dV）
+
+对充电曲线求 `dQ/dV`，得到若干特征峰：
+
+- 峰**位置**迁移 → 指示活性物损失类型。
+- 峰**面积/高度**变化 → 指示容量损失量。
+- 优点：只需恒流充电的 V-Q 数据，无需拆电池；是 SOH 在线估计热点。
+
+配套 **dV/dQ（微分电压 ICA 的另一种表示）** 也常用。
+
+### 4.6 在线 vs 离线 SOH
+
+- 离线：保养时做满充放，准但低频。
+- 在线：用 ICA / 部分充放 + 模型，持续估但精度低，需和离线结果融合。
+
+---
+
+## 5. 均衡 BAL（电芯一致性）
+
+### 5.1 为什么必须均衡
+
+电芯制造公差、温度梯度、自放电、老化差异 → SOC/容量/内阻不一致 → **木桶效应**：pack 可用容量由最差电芯决定，且最差芯易过充/过放。均衡把各芯拉齐，释放容量、降风险。
+
+### 5.2 被动均衡（Passive / 能耗式）
+
+- 拓扑：每芯并联一个放电电阻 + MOS，需要放电的芯通过电阻把多余能量**以热的形式耗掉**。
+- 控制：监测各芯 SOC/电压，对高于最低者的芯开启放电 MOS，直到对齐阈值内。
+- 优点：**简单、便宜、可靠**，几乎不会搞坏电池。
+- 缺点：**慢**（典型 100~200mA，均衡几 %SOC 要小时级）、**发热**、**只放电不均衡**（不能把高芯能量给低芯）。
+
+### 5.3 主动均衡（Active / 能量转移式）
+
+核心思想：把高 SOC 芯的能量**转移**到低 SOC 芯，而非浪费。
+
+| 拓扑 | 转移方式 | 效率 | 速度 | 成本/复杂度 | 备注 |
+|---|---|---|---|---|---|
+| 电容式 | 电容在相邻芯间中转 | 中(60~80%) | 中 | 低 | 结构简单，相邻搬运 |
+| 电感/flyback | 磁能中转 | 高(85~95%) | 快 | 中 | 常用专用芯片(如 LTC3300) |
+| Buck-Boost/Cuk | 模块间 DC-DC | 高 | 快 | 中高 | 灵活，可跨模组 |
+| 集中总线式 | 全部芯→总线→再分配 | 高 | 快 | 高 | 控制复杂但均衡强 |
+
+- 优点：高效、快、双向、节能，适合大容量/不一致严重场景。
+- 缺点：拓扑复杂、成本高、EMI 大、控制算法要求高。
+
+### 5.4 均衡策略与判据
+
+- **判据**：基于电压差（mV）或基于 SOC 差（更准，推荐）。带滞回避免抖动。
+- **阈值**：如 SOC 差 > 3% 启动，< 0.5% 停止。
+- **控制算法**：
+  - 规则查表：简单可靠，量产常用。
+  - 基于模型：先估各芯 SOC 再决策，更优但需好模型。
+  - MPC：优化均衡路径，科研向。
+- **窗口**：充电末端（压差最大）、静置、行车中按需。
+- **发热/时间估算**：被动均衡功率 `P=I²·R`，时间 ≈ `ΔSOC·Q / I`；主动均衡看效率与转移电流。
+
+---
+
+## 6. SOP / SOE / 其他状态量
+
+### 6.1 SOP（State of Power，功率状态）
+
+问的是"当前还能以多大功率充/放电而不越限"。约束来自：
+
+- 电压上限/下限（Vmax 防过充、Vmin 防过放）。
+- SOC 边界、温度边界、内阻温升、热约束。
+
+简化欧姆模型（1RC 忽略极化）：
+
+```
+P_dis_max ≈ (OCV(z) - Vmin) * (OCV(z) - Vmin) / R0     // 放电（Vmin 下限）
+P_chg_max  ≈ (Vmax - OCV(z)) * (Vmax - OCV(z)) / R0     // 充电（Vmax 上限）
+```
+
+含极化更准确（考虑 ΔV = I·(R0+R1·(1-e^(-t/τ)))）。还要分**短时（如 10s）**与**持续**功率——短时允许更深极化。
+
+### 6.2 SOE（State of Energy，能量状态）
+
+- `SOE = 当前可用能量 / 额定能量`，能量 = ∫ 容量·电压。
+- 与 SOC 区别：SOC 是容量占比，SOE 是能量占比；低温下 SOC 高但电压低，SOE 更低，续航更短。
+- 续航估算：SOE → 可行驶里程。
+
+---
+
+## 7. 故障诊断与功能安全
+
+### 7.1 故障类型与 DEM 衔接
+
+| 故障 | 检测手段 | 处理 |
+|---|---|---|
+| 电压采样断线/短路/漂移 | 冗余采样、合理性检查 | 报 DTC，禁用该芯估算 |
+| 温度 NTC 开路/短路 | 上拉/下拉电阻诊断 | 报 DTC |
+| 电流偏置/饱和 | 零漂校准、量程检查 | 修正/限功率 |
+| 均衡失效/过热 | 均衡电流监测、温度 | 关均衡、报 DTC |
+| 通信丢失 | 超时计数 | 进入安全态 |
+| 接触器粘连/不吸合 | 两端电压差判定 | 禁止充放 |
+| 绝缘电阻低 | 电桥/注入法测 ISO | 切断、报警 |
+
+所有故障经 **DEM（Diagnostic Event Manager）** 管理：DTC 设置/清除、故障计数（Debounce）、老化（Aging）、快照（Freeze Frame）。
+
+### 7.2 绝缘监测
+
+高压电池对车身地有绝缘电阻 `Riso`。监测法：
+
+- **电桥法**：在正负母线对地接已知电阻，测节点电压反推 Riso。
+- **注入信号法**：注入低频信号，测漏电流。
+- 低于阈值（如 100Ω/V）触发绝缘故障，整车下电。
+
+### 7.3 ISO 26262 安全（BMS 通常是 ASIL C/D 部分）
+
+- **安全目标**：防过充、防过放、防过温、防过流、防绝缘失效。
+- **冗余**：电压双采样通道、独立监控 MCU/ASIC、安全状态机。
+- **接触器控制状态机**：上电先**预充（precharge）**——先合预充电阻支路给负载电容充电，避免主接触器闭合瞬间的浪涌电流打弧；电容电压接近后闭合主接触器、断开预充。
+- **安全机制**：电压监测窗口、过流硬件比较器、独立看门狗、CRC 校验标定。
+
+---
+
+## 8. 热管理
+
+- **产热**：焦耳热 `I²R` + 极化热 + 熵热（可逆，放电吸热）。
+- **热模型**：集总参数热阻网络 `C_th·dT/dt = P_gen - (T - T_amb)/R_th`。
+- **冷却**：风冷（便宜、被动）、液冷（主流，均温好）、直冷（冷媒直膨）。
+- **加热**：低温预热（PTC/液热/电机废热），提升低温充电安全与功率。
+- **温差控制**：模组内温差 < 5℃ 是常见目标，靠流道/均衡协同。
+
+---
+
+## 9. Simulink 建模 → 代码生成（底层工程师友好，本笔记另一重点）
+
+### 9.1 为什么用 Simulink + Embedded Coder
+
+手写 C 控制逻辑没问题，但**复杂估计算法（EKF、查表、多速率）**用手写易错、难验证。Simulink 让你：
+
+- 算法可视化（框图即文档）。
+- 先在模型级仿真验证物理正确性（MIL）。
+- **一键生成产品级 C**（Embedded Coder），减少手写 bug。
+- 自动生成 AUTOSAR 接口（配合 AUTOSAR Blockset / arxml）。
+
+> 边界：简单 if/else 控制逻辑手写更灵活；复杂数值算法/标定用模型。量产项目通常"框架手写 + 算法建模生成"混合。
+
+### 9.2 工具链（你本机 MATLAB R2024b 齐了）
+
+- Simulink + Simulink Coder + **Embedded Coder**。
+- **Fixed-Point Designer**：MCU 无 FPU 时做定点化。
+- Simulink Test + SIL/PIL：验证闭环。
+- AUTOSAR Blockset / arxml 导入导出：对接 EB tresos 等。
+
+### 9.3 建模四步法（以"SOC 安时积分 + 1RC EKF"为例）
+
+**Step1 建算法模型**：
+- `Integrator` 块实现 SOC 积分（输入 = -I/(3600·Qn)）。
+- `MATLAB Function` 块写 EKF 递推（或 Discrete FIR / 查表组合）。
+- `1-D Lookup Table` 放 OCV(z)、dOCV/dz、Qn(T)、容量表。
+- `Rate Transition` 处理多速率（电流 1ms、估算 10ms）。
+
+**Step2 配信号**：数据类型 double → single → `fixdt(1,16,12)`（定点，1 符号位、16 总长、12 小数位）。采样时间设 0.01（10ms）。
+
+**Step3 配求解器**：定步长离散（Fixed-step, discrete），步长 = 任务周期，和 MCU 任务严格一致。
+
+**Step4 配代码生成**：
+- System target file = `ert.tlc`（Embedded Real-Time）。
+- 存储类（Storage Class）：状态量用 `ExportedGlobal` 或放到 DWork；接口用 `Model` 函数（生成 `BMS_step()`）。
+- 文件分区：算法/查表/接口分开，便于集成。
+
+### 9.4 生成代码结构（读懂它，你就懂"模型=代码"）
+
+```
+/* BMS.h */
+typedef struct {
+    real32_T SOC;     /* 状态：SOC */
+    real32_T Vc1;     /* 状态：极化电压 */
+} DW_BMS_T;           /* DWork 结构体，掉电需 NvM 保存 */
+
+/* BMS.c */
+void BMS_step(void) {
+    /* 1) 读输入：电流 I、端电压 V_meas（来自 RTE/ADC） */
+    /* 2) EKF 预测：SOC_pred, Vc1_pred */
+    /* 3) EKF 更新：用 V_meas 校正 */
+    /* 4) 写输出：SOC_est（经 RTE 发 CAN / 存 NvM） */
+    DW_BMS.SOC = ...;
+    DW_BMS.Vc1 = ...;
+}
+```
+
+定点生成的查表（线性插值）：
+
+```c
+/* OCV 查表生成示意（定点） */
+int16_T y = LUT_Interp(...);   /* 输入 SOC*10000 存 int16，避免浮点 */
+```
+
+> 关键点：SOC、Vc1 存在 DWork 里，**掉电要经 NvM 保存**，否则下次上电 EKF 要从头收敛（SOC 漂移）。这正是前面 Flash/Fee/NvM 章节的用武之地。
+
+### 9.5 与 AUTOSAR Runnable 映射
+
+- 模型经 AUTOSAR Blockset 或 arxml 导入导出，生成 SWC + Runnable。
+- Runnable 触发：`TimingEvent`（10ms）→ OS 任务周期触发。
+- 端口经 RTE：`Rte_Read_<port>` 取电流/电压，`Rte_Write_<port>` 发 SOC。
+- NvM：SOC 初值/学习值映射到 NvM Block，上电 `ReadAll` 恢复、周期 `WriteAll` 持久化。
+
+### 9.6 验证闭环：MIL / SIL / PIL / HIL
+
+| 阶段 | 在哪跑 | 目的 |
+|---|---|---|
+| MIL | Simulink 模型仿真 | 算法逻辑/物理正确性 |
+| SIL | 生成 C 在 PC 跑 | 验证"生成的代码=模型"（同输入比输出） |
+| PIL | 生成代码烧目标板跑，PC 监控 | 验证目标编译器/定点/时序 |
+| HIL | 接真实 ECU + 负载箱 | 系统级整车工况验证 |
+
+容差（Tolerance）配置：PIL 与 MIL 输出差需 < 设定阈值（如 1e-3），否则查定点溢出/编译器差异。
+
+### 9.7 最小可练链路（在你 S32K144 上落地）
+
+目标：安时积分 SOC → RTE → CAN 发出，跑通"配置→生成→烧录→看帧"。
+
+1. Simulink 建 SOC 安时积分模型，配 ERT + 存储类。
+2. 生成 C，拖进 S32DS 工程。
+3. EB tresos 配：Os（10ms 任务）、Com/CAN（一帧发 SOC）、NvM（存 SOC）。
+4. 编译烧录 S32K144。
+5. CANoe/CANalyzer（或你的 USB-CAN）看 SOC 帧，喂模拟电流验证变化。
+
+这条链路一旦通，OS/Com/NvM/算法四个模块全活，且全是你简历 BMS 岗位的真实场景。
+
+---
+
+## 10. 从算法到量产：标定与 OTA
+
+- **标定参数（A2L + 标定工具）**：OCV 表、容量 Qn(T)、内阻、均衡阈值、EKF 的 Q/R、滤波系数。
+- **数据驱动迭代**：实车数据回灌仿真，调参后再 OTA。
+- **OTA 更新**：算法与标定分离（标定走 NvM/参数区），安全校验 + 回滚机制，避免变砖。
+
+---
+
+## 11. 工程坑与面试高频
+
+### 11.1 高频翻车点
+
+- **LFP OCV 平坦** → 纯 OCV 查表失效，SOC 高度依赖电流积分。
+- **低温 SOC 跳变** → Qn 未随温补偿，或 OCV 表未分温。
+- **EKF 发散** → Q/R 错配、雅可比算错、初值离谱、定点溢出。
+- **均衡发热** → 被动均衡电流/占空比过大，温升触发二次故障。
+- **NvM 频繁写** → SOC 每周期写磨损 Flash，应降频/只写变化大的。
+- **电流偏置累积** → 不校准零漂，SOC 长期单调漂。
+- **定点溢出** → SOC*比例因子超 int16 范围，需选好小数位。
+
+### 11.2 面试速查题（覆盖深挖）
+
+1. SOC 有几种估法，各自优劣？
+2. 为什么 LFP 比 NMC 难估 SOC？
+3. EKF 的雅可比 H 里 dOCV/dz 怎么来？
+4. 卡尔曼增益 K 的物理意义？太大/太小会怎样？
+5. UKF 为什么不用雅可比？sigma 点什么作用？
+6. SOH 容量法和内阻法为何不一致？
+7. ICA(dQ/dV) 怎么用于 SOH？
+8. 被动 vs 主动均衡拓扑与取舍？
+9. 主动均衡用 Buck-Boost 和电容式区别？
+10. 均衡判据用电压差还是 SOC 差好？
+11. SOP 受哪些约束？简化公式怎么推？
+12. 绝缘监测的电桥法原理？
+13. 接触器预充时序为什么必须？不打弧会怎样？
+14. BMS 通常 ASIL 几级？安全目标有哪些？
+15. Simulink 生成的 SOC 状态量掉电为何要存 NvM？
+16. MIL/SIL/PIL 区别？PIL 为什么必要？
+17. 定点化 SOC 怎么存？比例因子怎么选？
+18. 电流采样偏置怎么处理？
+19. EKF 的 Q、R 分别整定什么？
+20. 满充校准为什么重要，但用户不满充怎么办？
+
+---
+
+## 12. EKF 在 2RC 模型下的完整矩阵形式
+
+状态 `x=[z, v1, v2]^T`，输入 `u=I`。
+
+状态方程（前向欧拉）：
+
+```
+z(k)  = z(k-1) - I*Ts/(3600*Qn)
+v1(k) = v1(k-1) + Ts*(I*R1 - v1(k-1))/(R1*C1)
+v2(k) = v2(k-1) + Ts*(I*R2 - v2(k-1))/(R2*C2)
+V(k)  = OCV(z(k)) - I*R0 - v1(k) - v2(k)
+```
+
+状态转移雅可比 `F=∂f/∂x`（3x3）：
+
+```
+F = [ 1,               0,            0   ;
+      0,  1 - Ts/(R1*C1),            0   ;
+      0,             0,  1 - Ts/(R2*C2) ]
+```
+
+（z 对其他状态无耦合、极化支路互不耦合，这是 ECM 的稀疏好处，雅可比大部分为 0。）
+
+观测雅可比 `H=∂h/∂x`（1x3）：
+
+```
+H = [ dOCV/dz,  -1,  -1 ]
+```
+
+EKF 五步递推同 1RC，只是 F/H 维度变为 3x3 / 1x3，P 为 3x3。2RC 对脉冲/大功率工况端电压预测更准，但状态维数高、计算量大、参数辨识更难——量产是否在 1RC/2RC 间取舍，看工况剧烈程度与 MCU 算力。
+
+## 13. UKF 具体算法（含 sigma 点公式）
+
+对 n 维状态，取 2n+1 个 sigma 点：
+
+```
+χ0 = x̂ ;   W0^(m)=λ/(n+λ) ; W0^(c)=λ/(n+λ)+(1-α²+β)
+χi = x̂ ± sqrt((n+λ)*P) 的左右根 (i=1..2n)
+Wi^(m)=Wi^(c)=1/(2(n+λ))
+λ = α²(n+κ) - n    (α 小→点靠近均值, 典型 1e-3; β 编码先验高斯度, 取 2)
+```
+
+预测：`χ_k^- = f(χ_{k-1}^+)`；`x̂^- = Σ W^m χ^-`；`P^- = Σ W^c (χ^- - x̂^-)(...)ᵀ + Q`。
+观测：`γ = h(χ^-)`；`ŷ = Σ W^m γ`；`Py = Σ W^c(γ-ŷ)(...)ᵀ + R`；`Pxy = Σ W^c(χ^- - x̂^-)(γ-ŷ)ᵀ`。
+更新：`K=Pxy·Py⁻¹`；`x̂^+ = x̂^- + K(y-ŷ)`；`P^+ = P^- - K·Py·Kᵀ`。
+
+UKF 免雅可比，对 OCV 尖锐非线性更稳，是 NMC 高精度估算的常见选择；代价算力约 2~3×EKF。
+
+## 14. 算法评估指标与测试矩阵
+
+- **RMSE / MAE**：SOC 估计与真值偏差，量产验收常要求 RMSE < 2%~3%、端电压预测 < 10~20mV。
+- **收敛时间**：初值给错（如给 50% 实际 80%）多久回到真值。
+- **鲁棒性测试矩阵**：
+
+| 工况 | 目的 |
+|---|---|
+| 常温 NEDC/UDDS | 基础精度 |
+| 低温 -20℃ | 容量/内阻补偿 |
+| 大倍率充放 | 极化建模 |
+| 随机电流 | 抗噪声 |
+| 满充满放 | 校准锚点 |
+| 传感器偏置注入 | 容错 |
+
+## 15. 均衡控制算法（伪代码）
+
+被动（规则查表）：
+
+```c
+for (i = 0; i < N_CELL; i++) {
+    if (SOC[i] - SOC_min > THR_ON)  balance_mos_on(i);
+    if (SOC[i] - SOC_min < THR_OFF) balance_mos_off(i);
+}
+```
+
+主动（基于模型，先估各芯 SOC 再决策转移路径）：
+
+```c
+sort_cells_by_soc();
+while (max_diff > THR) {
+    src = highest_soc_cell();  dst = lowest_soc_cell();
+    route_energy(src, dst);    // 经主动均衡转换器搬运
+}
+```
+
+控制要点：带滞回防抖、限温限流、充电末端优先、行车中低功耗模式。
+
+## 16. SOP 含极化的精确公式与时域
+
+含极化端电压：
+
+```
+V(t) = OCV(z) - I*R0 - I*R1*(1-e^{-t/τ1}) - I*R2*(1-e^{-t/τ2})
+```
+
+放电最大功率（受 Vmin 约束，解 V(t)≥Vmin 的 I）：
+
+- **短时（如 10s）**：允许更深极化，功率高。
+- **持续**：极化达稳态，功率低但可持续。
+
+工程做法：离线算"功率-电压-时间"三维表，运行时查表 + 内插，兼顾精度与算力。
+
+## 17. ISO 26262 在 BMS 的具体落地
+
+| 安全功能 | 典型 ASIL | 安全机制 |
+|---|---|---|
+| 过充保护 | C/D | 电压双采样 + 独立比较器 + 接触器断开 |
+| 过放保护 | C | 单体欠压监测 + 限功率 |
+| 过温保护 | C | 多 NTC + 冗余比较 |
+| 过流保护 | C/D | 硬件比较器 + 软件限流 |
+| 绝缘故障 | D | 电桥/注入法 + 整车下电 |
+| 接触器控制 | D | 预充状态机 + 粘连检测 |
+
+FMEA 片段：失效"电压采样断线"→ 后果"该芯过充未被发现"→ 严重度高 → 诊断"冗余采样合理性检查" → 覆盖度高。
+
+## 18. Simulink 代码生成配置速查 + 与 MCAL 衔接
+
+代码生成关键选项：
+
+| 选项 | 取值 | 说明 |
+|---|---|---|
+| System target file | ert.tlc | 产品级嵌入式 C |
+| Code interface | Model | 生成 BMS_step() |
+| Hardware board | 对应 MCU | S32K144 |
+| 数据类型 | fixdt | 无 FPU 时定点 |
+| 存储类 | ExportedGlobal / DWork | 状态持久化 |
+
+与 MCAL 驱动衔接：模型输入 `I`、`V_meas` 来自 **ADC 驱动**（MCAL Adc→滤波）；输出 `SOC_est` 经 **RTE → Com → CAN** 发出；**NvM** 存 DWork 状态。模型本身不碰寄存器，只消费 RTE 提供的端口数据——这正是 AUTOSAR「算法与驱动解耦」的体现。
+
+## 19. 集中式 vs 分布式 BMS 架构（影响算法部署）
+
+- **集中式**：一个主控采所有（经 SPI/isoSPI 读 AFE），算法集中跑。优点：算法简单、成本低；缺点：线束多、单点失效、扩展差。
+- **分布式**：从板（slave）就近采电压温度 + 均衡，主板（master）跑估算 + 通信。优点：线束少、可扩展、从板可做本地均衡；缺点：从板 MCU 弱、需确定性通信（isoSPI/CAN FD）。
+- 你的练习：S32K144 做从板（采 + 均衡），配一个 master 跑 SOC——正好是简历「从板」场景，算法部署位置也顺带理解了。
+
+## 21. 端到端算例：一次完整充电的 SOC/SOH/均衡联动
+
+描述一个典型慢充场景，展示各算法如何协作：
+
+1. 插枪，CC-CV 充电开始。电流 I 恒定（CC 段），SOC 由安时积分快速上升。
+2. EKF 用端电压持续校正积分漂移，每 1s 收敛一点。
+3. 当某芯电压先到上限（不一致），触发该芯被动均衡（放电），让整包继续充、包容量不被最差芯限制。
+4. 接近满电（CV 段，电流下降），累计本段安时 → 更新满充容量 Qmax_now → SOH 容量法刷新。
+5. 充满判定（电流 < 截至电流且电压到顶）→ SOC 锚定 100%。
+6. 学习值（SOC、Qmax、内阻）经 NvM 落盘，下次上电 ReadAll 恢复。
+
+这条链路把第 3（SOC）、第 4（SOH）、第 5（均衡）、第 9（NvM）串成闭环——理解它，面试讲项目就立体了。
+
+## 22. BMS 算法的 MCU 资源预算（底层工程师视角）
+
+| 资源 | 典型需求 | 说明 |
+|---|---|---|
+| Flash | 几十~几百 KB | 模型代码 + 查表（OCV/容量多维表占大头）+ 标定区 |
+| RAM | 几~几十 KB | DWork 状态、滤波协方差 P（3x3）、缓冲区 |
+| CPU | 主频 80~300MHz | 10ms 估算任务（EKF 矩阵运算）+ 100ms 慢速任务 |
+| 定点 | 无 FPU 时必做 | SOC*比例因子存 int16/int32，注意溢出与精度 |
+
+选型启示：S32K144（Cortex-M4F，带 FPU）对浮点 EKF 友好；更低端 M0 需严格定点化，EKF 可能降为 1RC 或查表法。
+
+## 23. 与简历亮点衔接（把"万级出货"讲透）
+
+面试被问"你做过什么"时，把上面内容落到你的项目：
+
+- **算法鲁棒**：讲温度/SOH 补偿、LFP 平坦段处理、EKF 冗余。
+- **可标定**：讲 OCV/容量/内阻表 + A2L 标定流程。
+- **可诊断**：讲与 DEM 衔接的 DTC、绝缘、接触器状态机。
+- **可 OTA**：讲算法/标定分离 + 安全更新。
+- **量产规模**：单季度万级 → 意味着上面每条都被真实车况、真实供应链公差检验过。
+
+> 记住：面试官深挖时，你答得上来"为什么这么做、踩过什么坑、怎么验证"，比背名词值钱十倍。本笔记就是为你攒这套"为什么"。
+
+</script>
+<script>
+function escapeHtml(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function renderInline(s){
+  s=escapeHtml(s);
+  s=s.replace(/`([^`]+)`/g,function(m,c){return '<code>'+c+'</code>';});
+  s=s.replace(/\*\*([^*]+)\*\*/g,function(m,c){return '<strong>'+c+'</strong>';});
+  return s;
+}
+function parseTable(rows){
+  function cells(r){return r.replace(/^\||\|$/g,'').split('|').map(function(x){return x.trim();});}
+  var hc=cells(rows[0]);
+  var html='<table><thead><tr>'+hc.map(function(c){return '<th>'+renderInline(c)+'</th>';}).join('')+'</tr></thead><tbody>';
+  rows.slice(2).forEach(function(r){ if(r.trim()==='')return; var c=cells(r); html+='<tr>'+c.map(function(x){return '<td>'+renderInline(x)+'</td>';}).join('')+'</tr>'; });
+  html+='</tbody></table>';
+  return html;
+}
+function mdToHtml(md){
+  var lines=md.split('\n'); var out=[]; var i=0;
+  var inCode=false, codeBuf=[], para=[];
+  function flushPara(){ if(para.length){ out.push('<p>'+renderInline(para.join(' '))+'</p>'); para=[]; } }
+  while(i<lines.length){
+    var line=lines[i];
+    if(line.indexOf('```')===0){
+      flushPara();
+      if(!inCode){ inCode=true; codeBuf=[]; }
+      else { out.push('<pre><code>'+escapeHtml(codeBuf.join('\n'))+'</code></pre>'); inCode=false; }
+      i++; continue;
+    }
+    if(inCode){ codeBuf.push(line); i++; continue; }
+    if(line.indexOf('### ')===0){ flushPara(); out.push('<h3>'+renderInline(line.slice(4))+'</h3>'); i++; continue; }
+    if(line.indexOf('## ')===0){ flushPara(); out.push('<h2>'+renderInline(line.slice(3))+'</h2>'); i++; continue; }
+    if(line.indexOf('# ')===0){ flushPara(); out.push('<h1>'+renderInline(line.slice(2))+'</h1>'); i++; continue; }
+    if(line.indexOf('|')===0){
+      flushPara();
+      var tbl=[];
+      while(i<lines.length && lines[i].indexOf('|')===0){ tbl.push(lines[i]); i++; }
+      out.push(parseTable(tbl));
+      continue;
+    }
+    if(line.indexOf('>')===0){
+      flushPara();
+      var bq=[];
+      while(i<lines.length && lines[i].indexOf('>')===0){ bq.push(lines[i].replace(/^>\s?/,'')); i++; }
+      out.push('<blockquote>'+renderInline(bq.join('<br>'))+'</blockquote>');
+      continue;
+    }
+    if(line.indexOf('- ')===0){
+      flushPara();
+      var lis=[];
+      while(i<lines.length && lines[i].indexOf('- ')===0){ lis.push('<li>'+renderInline(lines[i].slice(2))+'</li>'); i++; }
+      out.push('<ul>'+lis.join('')+'</ul>');
+      continue;
+    }
+    if(line.trim()===''){ flushPara(); i++; continue; }
+    para.push(line); i++;
+  }
+  flushPara();
+  if(inCode){ out.push('<pre><code>'+escapeHtml(codeBuf.join('\n'))+'</code></pre>'); }
+  return out.join('\n');
+}
+var md = document.getElementById('doc').textContent;
+document.getElementById('out').innerHTML = mdToHtml(md);
+</script>
+</body>
+</html>
